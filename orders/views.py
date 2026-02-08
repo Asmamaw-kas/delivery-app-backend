@@ -7,7 +7,7 @@ from rest_framework.permissions import IsAdminUser
 from .models import Order, OrderItem
 from .serializers import OrderSerializer, OrderCreateSerializer
 from menu.models import MenuItem
-from django.db.models import Count, Sum, Avg
+from django.db.models import Count, Sum, Avg, F, Q
 from users.models import User
 from datetime import timedelta
 from django_filters.rest_framework import DjangoFilterBackend
@@ -172,67 +172,106 @@ class CafeOrderUpdateAPIView(generics.UpdateAPIView):
         return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
     
 
+
 @api_view(['GET'])
 @permission_classes([IsAdminUser])
 def dashboard_stats(request):
-    # Calculate stats
-    total_orders = Order.objects.count()
-    pending_orders = Order.objects.filter(status__in=['pending', 'confirmed', 'preparing', 'ready', 'on_the_way']).count()
-    total_users = User.objects.count()
-    total_foods = MenuItem.objects.filter(category__category_type='food').count()
-    total_drinks = MenuItem.objects.filter(category__category_type='drink').count()
-    
-    # Revenue calculation
-    delivered_orders = Order.objects.filter(status='delivered')
-    total_revenue = delivered_orders.aggregate(total=Sum('total_amount'))['total'] or 0
-    
-    # Recent orders
-    recent_orders = Order.objects.all().order_by('-created_at')[:5]
-    
-    # Top products
-    top_products = OrderItem.objects.values(
-        'menu_item__name',
-        'menu_item__category__category_type'
-    ).annotate(
-        total_sold=Sum('quantity'),
-        total_revenue=Sum('price')
-    ).order_by('-total_sold')[:5]
-    
-    stats = {
-        'total_orders': total_orders,
-        'pending_orders': pending_orders,
-        'total_users': total_users,
-        'total_foods': total_foods,
-        'total_drinks': total_drinks,
-        'total_revenue': float(total_revenue),
-        'average_order_value': float(delivered_orders.aggregate(avg=Avg('total_amount'))['avg'] or 0),
-        'delivered_today': delivered_orders.filter(
-            delivered_at__date=timezone.now().date()
-        ).count(),
-        'recent_orders': [
-            {
-                'id': order.id,
-                'order_number': order.order_number,
-                'customer': order.customer.username,
-                'status': order.status,
-                'total_amount': float(order.total_amount),
-                'created_at': order.created_at,
-            }
-            for order in recent_orders
-        ],
-        'top_products': [
-            {
-                'name': item['menu_item__name'] or 'Unknown',
-                'type': item['menu_item__category__category_type'],
-                'sales_count': item['total_sold'],
-                'revenue': float(item['total_revenue'] or 0),
-            }
-            for item in top_products
-        ]
-    }
-    
-    return Response(stats)
-
+    try:
+        # Calculate basic stats
+        total_orders = Order.objects.count()
+        pending_orders = Order.objects.filter(
+            status__in=['pending', 'confirmed', 'preparing', 'ready', 'on_the_way']
+        ).count()
+        total_users = User.objects.count()
+        
+        # Menu items count by category type
+        total_foods = MenuItem.objects.filter(category__category_type='food').count()
+        total_drinks = MenuItem.objects.filter(category__category_type='drink').count()
+        
+        # Revenue calculation
+        delivered_orders = Order.objects.filter(status='delivered')
+        total_revenue = delivered_orders.aggregate(total=Sum('total_amount'))['total'] or 0
+        avg_order_value = delivered_orders.aggregate(avg=Avg('total_amount'))['avg'] or 0
+        
+        # Delivered today
+        today = timezone.now().date()
+        delivered_today = delivered_orders.filter(
+            delivered_at__date=today
+        ).count()
+        
+        # Recent orders with customer details
+        recent_orders = Order.objects.select_related('customer').order_by('-created_at')[:5]
+        
+        # Top products - FIXED: Calculate revenue correctly
+        top_products = OrderItem.objects.select_related(
+            'menu_item',
+            'menu_item__category'
+        ).values(
+            'menu_item__id',
+            'menu_item__name',
+            'menu_item__category__category_type'
+        ).annotate(
+            total_sold=Sum('quantity'),
+            total_revenue=Sum(F('price') * F('quantity'))  # FIXED: Multiply price by quantity
+        ).order_by('-total_sold')[:5]
+        
+        stats = {
+            'total_orders': total_orders,
+            'pending_orders': pending_orders,
+            'total_users': total_users,
+            'total_foods': total_foods,
+            'total_drinks': total_drinks,
+            'total_revenue': float(total_revenue),
+            'average_order_value': float(avg_order_value),
+            'delivered_today': delivered_today,
+            'recent_orders': [
+                {
+                    'id': order.id,
+                    'order_number': order.order_number,
+                    'customer': order.customer.username if order.customer else 'Guest',
+                    'customer_email': order.customer.email if order.customer else '',
+                    'status': order.status,
+                    'total_amount': float(order.total_amount),
+                    'created_at': order.created_at.isoformat(),
+                }
+                for order in recent_orders
+            ],
+            'top_products': [
+                {
+                    'id': item['menu_item__id'],
+                    'name': item['menu_item__name'] or 'Unknown',
+                    'type': item['menu_item__category__category_type'] or 'unknown',
+                    'sales_count': item['total_sold'] or 0,
+                    'revenue': float(item['total_revenue'] or 0),
+                }
+                for item in top_products
+            ]
+        }
+        
+        return Response(stats, status=200)
+        
+    except Exception as e:
+        # Log the error for debugging
+        import traceback
+        print(f"❌ Dashboard stats error: {str(e)}")
+        print(traceback.format_exc())
+        
+        # Return error with default values
+        return Response({
+            'error': str(e),
+            'total_orders': 0,
+            'pending_orders': 0,
+            'total_users': 0,
+            'total_foods': 0,
+            'total_drinks': 0,
+            'total_revenue': 0.0,
+            'average_order_value': 0.0,
+            'delivered_today': 0,
+            'recent_orders': [],
+            'top_products': []
+        }, status=200)  # Still return 200 so frontend doesn't break
+        
+        
 @api_view(['GET'])
 @permission_classes([IsAdminUser])
 def analytics_data(request):
