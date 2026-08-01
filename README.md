@@ -98,6 +98,3 @@ delivery-app/
 
 ---
 
-## 🪪 License
-
-MIT © 2026
